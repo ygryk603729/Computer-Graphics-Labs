@@ -477,7 +477,7 @@ void OnResize(UINT newWidth, UINT newHeight)
 }
 
 // ──────────────────────────────────────────────
-// Отрисовка одного кадра
+// Отрисовка одного кадра 
 // ──────────────────────────────────────────────
 
 void RenderFrame()
@@ -491,7 +491,7 @@ void RenderFrame()
     m_pDeviceContext->OMSetRenderTargets(1, views, nullptr);
 
     // Цвет заливки
-    static const FLOAT clearColor[4] = { 0.1f, 0.2f, 0.3f, 1.0f };   // тёмно-синий
+    static const FLOAT clearColor[4] = { 0.1f, 0.2f, 0.3f, 1.0f };
     m_pDeviceContext->ClearRenderTargetView(g_pBackBufferRTV, clearColor);
 
     // настройка viewport
@@ -522,12 +522,12 @@ void RenderFrame()
     m_pDeviceContext->DrawIndexed(3, 0, 0);
 
     // показ кадра
-    g_pSwapChain->Present(1, 0);   // 1 - VSync включён, 0 - нет
+    g_pSwapChain->Present(1, 0);
 }
 
 
 void CleanupDirectX()
-{    
+{
     if (m_pDeviceContext)
         m_pDeviceContext->ClearState();
 
@@ -540,7 +540,7 @@ void CleanupDirectX()
 
     SAFE_RELEASE(g_pBackBufferRTV);
     SAFE_RELEASE(g_pSwapChain);
-    
+
     if (g_pDevice)
     {
 #ifdef _DEBUG
