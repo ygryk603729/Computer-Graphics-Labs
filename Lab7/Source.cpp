@@ -73,35 +73,82 @@ std::string WCSToMBS(const std::wstring& wstr)
     WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
     return strTo;
 }
+
 struct TextureDesc { UINT32 pitch = 0, mipmapsCount = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; UINT32 width = 0, height = 0; void* pData = nullptr; };
-bool LoadDDS(const wchar_t* filename, TextureDesc& desc)
+
+bool LoadDDS(const wchar_t* filename, TextureDesc& desc, std::vector<void*>* pMipData = nullptr, std::vector<UINT32>* pMipPitches = nullptr)
 {
     HANDLE hFile = CreateFileW(filename, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return false;
+
     DWORD dwMagic, dwBytesRead;
     ReadFile(hFile, &dwMagic, sizeof(DWORD), &dwBytesRead, NULL);
     if (dwMagic != DDS_MAGIC) { CloseHandle(hFile); return false; }
+
     DDS_HEADER header;
     ReadFile(hFile, &header, sizeof(DDS_HEADER), &dwBytesRead, NULL);
-    desc.width = header.dwWidth; desc.height = header.dwHeight;
+
+    desc.width = header.dwWidth;
+    desc.height = header.dwHeight;
     desc.mipmapsCount = (header.dwSurfaceFlags & DDS_SURFACE_FLAGS_MIPMAP) ? header.dwMipMapCount : 1;
-    if (header.ddspf.dwFlags & DDS_FOURCC) {
-        switch (header.ddspf.dwFourCC) {
+
+    if (header.ddspf.dwFlags & DDS_FOURCC)
+    {
+        switch (header.ddspf.dwFourCC)
+        {
         case FOURCC_DXT1: desc.fmt = DXGI_FORMAT_BC1_UNORM; break;
         case FOURCC_DXT3: desc.fmt = DXGI_FORMAT_BC2_UNORM; break;
         case FOURCC_DXT5: desc.fmt = DXGI_FORMAT_BC3_UNORM; break;
         default: desc.fmt = DXGI_FORMAT_UNKNOWN; break;
         }
     }
-    else if (header.ddspf.dwFlags & DDS_RGB) desc.fmt = DXGI_FORMAT_UNKNOWN;
+    else if (header.ddspf.dwFlags & DDS_RGB)
+    {
+        desc.fmt = DXGI_FORMAT_UNKNOWN;
+    }
+
     if (desc.fmt == DXGI_FORMAT_UNKNOWN) { CloseHandle(hFile); return false; }
-    UINT32 blockWidth = DivUp(desc.width, 4u), blockHeight = DivUp(desc.height, 4u);
-    UINT32 pitch = blockWidth * GetBytesPerBlock(desc.fmt);
-    UINT32 dataSize = pitch * blockHeight;
-    desc.pData = malloc(dataSize);
-    if (!desc.pData) { CloseHandle(hFile); return false; }
-    ReadFile(hFile, desc.pData, dataSize, &dwBytesRead, NULL);
+
+    // Рассчитываем общий размер данных всех мипов
+    UINT32 totalSize = 0;
+    UINT32 w = desc.width, h = desc.height;
+    for (UINT32 mip = 0; mip < desc.mipmapsCount; ++mip)
+    {
+        UINT32 blockW = DivUp(w, 4u);
+        UINT32 blockH = DivUp(h, 4u);
+        UINT32 pitch = blockW * GetBytesPerBlock(desc.fmt);
+        UINT32 mipSize = pitch * blockH;
+        if (pMipPitches) pMipPitches->push_back(pitch);
+        totalSize += mipSize;
+        w = max(w / 2, 1u);
+        h = max(h / 2, 1u);
+    }
+
+    // Читаем все мипы за один раз (они идут подряд)
+    void* pAllData = malloc(totalSize);
+    if (!pAllData) { CloseHandle(hFile); return false; }
+    ReadFile(hFile, pAllData, totalSize, &dwBytesRead, NULL);
     CloseHandle(hFile);
+
+    // Если нужны отдельные указатели на каждый мип
+    if (pMipData)
+    {
+        BYTE* pCurrent = (BYTE*)pAllData;
+        w = desc.width; h = desc.height;
+        for (UINT32 mip = 0; mip < desc.mipmapsCount; ++mip)
+        {
+            UINT32 blockW = DivUp(w, 4u);
+            UINT32 blockH = DivUp(h, 4u);
+            UINT32 pitch = blockW * GetBytesPerBlock(desc.fmt);
+            UINT32 mipSize = pitch * blockH;
+            pMipData->push_back(pCurrent);
+            pCurrent += mipSize;
+            w = max(w / 2, 1u);
+            h = max(h / 2, 1u);
+        }
+    }
+
+    desc.pData = pAllData;
     return true;
 }
 
@@ -765,51 +812,96 @@ void LoadTextures()
     std::wstring colorTexPath = basePath + L"brick.dds";
     std::wstring normalTexPath = basePath + L"brick_normal.dds";
 
+    // Загрузка color map с мипами
     TextureDesc texDesc;
-    if (!LoadDDS(colorTexPath.c_str(), texDesc)) { MessageBoxA(NULL, "Failed to load brick.dds", "Error", MB_OK); return; }
+    std::vector<void*> mipData;
+    std::vector<UINT32> mipPitches;
+    if (!LoadDDS(colorTexPath.c_str(), texDesc, &mipData, &mipPitches))
+    {
+        MessageBoxA(NULL, "Failed to load brick.dds", "Error", MB_OK);
+        return;
+    }
+
     D3D11_TEXTURE2D_DESC tex2DDesc = {};
-    tex2DDesc.Width = texDesc.width; tex2DDesc.Height = texDesc.height;
-    tex2DDesc.MipLevels = 1; tex2DDesc.ArraySize = 1; tex2DDesc.Format = texDesc.fmt;
-    tex2DDesc.SampleDesc.Count = 1; tex2DDesc.Usage = D3D11_USAGE_IMMUTABLE; tex2DDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    UINT blockWidth = DivUp(texDesc.width, 4u); UINT blockHeight = DivUp(texDesc.height, 4u);
-    UINT pitch = blockWidth * GetBytesPerBlock(texDesc.fmt);
-    D3D11_SUBRESOURCE_DATA texData = { texDesc.pData, pitch, 0 };
+    tex2DDesc.Width = texDesc.width;
+    tex2DDesc.Height = texDesc.height;
+    tex2DDesc.MipLevels = texDesc.mipmapsCount;
+    tex2DDesc.ArraySize = 1;
+    tex2DDesc.Format = texDesc.fmt;
+    tex2DDesc.SampleDesc.Count = 1;
+    tex2DDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    tex2DDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    std::vector<D3D11_SUBRESOURCE_DATA> initData(texDesc.mipmapsCount);
+    for (UINT32 i = 0; i < texDesc.mipmapsCount; ++i)
+    {
+        initData[i].pSysMem = mipData[i];
+        initData[i].SysMemPitch = mipPitches[i];
+        initData[i].SysMemSlicePitch = 0;
+    }
+
     ID3D11Texture2D* pTexture = nullptr;
-    hr = g_pDevice->CreateTexture2D(&tex2DDesc, &texData, &pTexture); free(texDesc.pData);
+    hr = g_pDevice->CreateTexture2D(&tex2DDesc, initData.data(), &pTexture);
+    free(texDesc.pData);
     if (FAILED(hr)) return;
 
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = texDesc.fmt;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = texDesc.mipmapsCount;
+    hr = g_pDevice->CreateShaderResourceView(pTexture, &srvDesc, &g_pTextureView);
+    pTexture->Release();
+    if (FAILED(hr)) return;
+
+    // Загрузка normal map с мипами
     TextureDesc normalDesc;
-    if (LoadDDS(normalTexPath.c_str(), normalDesc))
+    std::vector<void*> normalMipData;
+    std::vector<UINT32> normalMipPitches;
+    if (LoadDDS(normalTexPath.c_str(), normalDesc, &normalMipData, &normalMipPitches))
     {
         D3D11_TEXTURE2D_DESC normTexDesc = {};
-        normTexDesc.Width = normalDesc.width; normTexDesc.Height = normalDesc.height;
-        normTexDesc.MipLevels = 1; normTexDesc.ArraySize = 1; normTexDesc.Format = normalDesc.fmt;
-        normTexDesc.SampleDesc.Count = 1; normTexDesc.Usage = D3D11_USAGE_IMMUTABLE; normTexDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        UINT nBlockW = DivUp(normalDesc.width, 4u); UINT nPitch = nBlockW * GetBytesPerBlock(normalDesc.fmt);
-        D3D11_SUBRESOURCE_DATA nData = { normalDesc.pData, nPitch, 0 };
+        normTexDesc.Width = normalDesc.width;
+        normTexDesc.Height = normalDesc.height;
+        normTexDesc.MipLevels = normalDesc.mipmapsCount;
+        normTexDesc.ArraySize = 1;
+        normTexDesc.Format = normalDesc.fmt;
+        normTexDesc.SampleDesc.Count = 1;
+        normTexDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        normTexDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        std::vector<D3D11_SUBRESOURCE_DATA> nInitData(normalDesc.mipmapsCount);
+        for (UINT32 i = 0; i < normalDesc.mipmapsCount; ++i)
+        {
+            nInitData[i].pSysMem = normalMipData[i];
+            nInitData[i].SysMemPitch = normalMipPitches[i];
+            nInitData[i].SysMemSlicePitch = 0;
+        }
+
         ID3D11Texture2D* pNormalTex = nullptr;
-        hr = g_pDevice->CreateTexture2D(&normTexDesc, &nData, &pNormalTex);
+        hr = g_pDevice->CreateTexture2D(&normTexDesc, nInitData.data(), &pNormalTex);
         if (SUCCEEDED(hr))
         {
-            D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-            srvDesc.Format = normalDesc.fmt; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Texture2D.MipLevels = 1;
-            hr = g_pDevice->CreateShaderResourceView(pNormalTex, &srvDesc, &g_pNormalMapView);
+            D3D11_SHADER_RESOURCE_VIEW_DESC nSrvDesc = {};
+            nSrvDesc.Format = normalDesc.fmt;
+            nSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            nSrvDesc.Texture2D.MipLevels = normalDesc.mipmapsCount;
+            hr = g_pDevice->CreateShaderResourceView(pNormalTex, &nSrvDesc, &g_pNormalMapView);
             pNormalTex->Release();
         }
         free(normalDesc.pData);
     }
 
-    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = texDesc.fmt; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; srvDesc.Texture2D.MipLevels = 1;
-    hr = g_pDevice->CreateShaderResourceView(pTexture, &srvDesc, &g_pTextureView);
-    pTexture->Release();
-
+    // Создание сэмплера с поддержкой мипов
     D3D11_SAMPLER_DESC sampDesc = {};
-    sampDesc.Filter = D3D11_FILTER_ANISOTROPIC; sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
-    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP; sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
-    sampDesc.MinLOD = -FLT_MAX; sampDesc.MaxLOD = FLT_MAX; sampDesc.MipLODBias = 0.0f;
-    sampDesc.MaxAnisotropy = 16; sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sampDesc.Filter = D3D11_FILTER_ANISOTROPIC;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.MinLOD = -FLT_MAX;
+    sampDesc.MaxLOD = FLT_MAX;
+    sampDesc.MipLODBias = 0.0f;
+    sampDesc.MaxAnisotropy = 16;
+    sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sampDesc.BorderColor[0] = sampDesc.BorderColor[1] = sampDesc.BorderColor[2] = sampDesc.BorderColor[3] = 1.0f;
     g_pDevice->CreateSamplerState(&sampDesc, &g_pSampler);
 
@@ -819,34 +911,61 @@ void LoadTextures()
         skyboxPath + L"posx.dds", skyboxPath + L"negx.dds", skyboxPath + L"posy.dds",
         skyboxPath + L"negy.dds", skyboxPath + L"posz.dds", skyboxPath + L"negz.dds"
     };
+
     TextureDesc faceDescs[6];
     bool allOk = true;
-    for (int i = 0; i < 6; ++i) if (!LoadDDS(faceNames[i].c_str(), faceDescs[i])) { allOk = false; break; }
+    for (int i = 0; i < 6; ++i)
+        if (!LoadDDS(faceNames[i].c_str(), faceDescs[i]))
+        {
+            allOk = false; break;
+        }
+
     if (!allOk) { MessageBoxA(NULL, "Failed to load cubemap faces", "Error", MB_OK); return; }
+
     D3D11_TEXTURE2D_DESC cubeDesc = {};
-    cubeDesc.Width = faceDescs[0].width; cubeDesc.Height = faceDescs[0].height;
-    cubeDesc.MipLevels = 1; cubeDesc.ArraySize = 6; cubeDesc.Format = faceDescs[0].fmt;
-    cubeDesc.SampleDesc.Count = 1; cubeDesc.Usage = D3D11_USAGE_IMMUTABLE;
-    cubeDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE; cubeDesc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-    blockWidth = DivUp(cubeDesc.Width, 4u); blockHeight = DivUp(cubeDesc.Height, 4u);
-    pitch = blockWidth * GetBytesPerBlock(cubeDesc.Format);
-    D3D11_SUBRESOURCE_DATA initData[6];
-    for (int i = 0; i < 6; ++i) { initData[i].pSysMem = faceDescs[i].pData; initData[i].SysMemPitch = pitch; }
+    cubeDesc.Width = faceDescs[0].width;
+    cubeDesc.Height = faceDescs[0].height;
+    cubeDesc.MipLevels = 1;
+    cubeDesc.ArraySize = 6;
+    cubeDesc.Format = faceDescs[0].fmt;
+    cubeDesc.SampleDesc.Count = 1;
+    cubeDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    cubeDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    cubeDesc.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+
+    UINT32 blockWidth = DivUp(cubeDesc.Width, 4u);
+    UINT32 blockHeight = DivUp(cubeDesc.Height, 4u);
+    UINT32 pitch = blockWidth * GetBytesPerBlock(cubeDesc.Format);
+
+    std::vector<D3D11_SUBRESOURCE_DATA> cubeInitData(6);
+    for (int i = 0; i < 6; ++i)
+    {
+        cubeInitData[i].pSysMem = faceDescs[i].pData;
+        cubeInitData[i].SysMemPitch = pitch;
+        cubeInitData[i].SysMemSlicePitch = 0;
+    }
+
     ID3D11Texture2D* pCubemapTex = nullptr;
-    hr = g_pDevice->CreateTexture2D(&cubeDesc, initData, &pCubemapTex);
+    hr = g_pDevice->CreateTexture2D(&cubeDesc, cubeInitData.data(), &pCubemapTex);
+
     for (int i = 0; i < 6; ++i) free(faceDescs[i].pData);
+
     if (SUCCEEDED(hr))
     {
         D3D11_SHADER_RESOURCE_VIEW_DESC cubeSRVDesc = {};
-        cubeSRVDesc.Format = cubeDesc.Format; cubeSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
-        cubeSRVDesc.TextureCube.MipLevels = 1; cubeSRVDesc.TextureCube.MostDetailedMip = 0;
+        cubeSRVDesc.Format = cubeDesc.Format;
+        cubeSRVDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+        cubeSRVDesc.TextureCube.MipLevels = 1;
+        cubeSRVDesc.TextureCube.MostDetailedMip = 0;
         hr = g_pDevice->CreateShaderResourceView(pCubemapTex, &cubeSRVDesc, &g_pCubemapView);
         pCubemapTex->Release();
     }
 
     // Rasterizer states
     D3D11_RASTERIZER_DESC rsDesc = {};
-    rsDesc.FillMode = D3D11_FILL_SOLID; rsDesc.CullMode = D3D11_CULL_BACK; rsDesc.FrontCounterClockwise = FALSE;
+    rsDesc.FillMode = D3D11_FILL_SOLID;
+    rsDesc.CullMode = D3D11_CULL_BACK;
+    rsDesc.FrontCounterClockwise = FALSE;
     g_pDevice->CreateRasterizerState(&rsDesc, &g_pRSCullBack);
     rsDesc.CullMode = D3D11_CULL_NONE;
     g_pDevice->CreateRasterizerState(&rsDesc, &g_pRSCullNone);
@@ -858,9 +977,11 @@ void LoadTextures()
 void LoadTextureArray()
 {
     std::vector<TextureDesc> texDescs(NUM_TEXTURES);
+    std::vector<std::vector<void*>> mipDataPerTex(NUM_TEXTURES);
+    std::vector<std::vector<UINT32>> mipPitchesPerTex(NUM_TEXTURES);
     std::vector<bool> loaded(NUM_TEXTURES, false);
     std::wstring basePath = GetExePath() + L"..\\..\\textures\\";
-    // Try multiple candidate locations for textures
+
     for (UINT i = 0; i < NUM_TEXTURES; ++i)
     {
         std::wstring candidates[] = {
@@ -870,68 +991,108 @@ void LoadTextureArray()
         };
         for (auto& p : candidates)
         {
-            if (LoadDDS(p.c_str(), texDescs[i])) { loaded[i] = true; break; }
+            if (LoadDDS(p.c_str(), texDescs[i], &mipDataPerTex[i], &mipPitchesPerTex[i]))
+            {
+                loaded[i] = true;
+                break;
+            }
         }
     }
 
-    // If none loaded at all -> fail
-    bool anyLoaded = false; for (bool b : loaded) if (b) { anyLoaded = true; break; }
+    bool anyLoaded = false;
+    for (bool b : loaded) if (b) { anyLoaded = true; break; }
     if (!anyLoaded) { MessageBoxA(NULL, "Failed to load textures for array", "Error", MB_OK); return; }
 
-    // If some textures failed, duplicate the first successfully loaded texture
-    int firstIdx = -1; for (UINT i = 0; i < NUM_TEXTURES; ++i) if (loaded[i]) { firstIdx = (int)i; break; }
+    int firstIdx = -1;
+    for (UINT i = 0; i < NUM_TEXTURES; ++i) if (loaded[i]) { firstIdx = (int)i; break; }
+
+    // Если какая-то текстура не загрузилась, дублирую первую успешную (включая мипы)
     for (UINT i = 0; i < NUM_TEXTURES; ++i)
     {
         if (!loaded[i])
         {
-            // duplicate descriptor (allocate new buffer)
             TextureDesc& src = texDescs[firstIdx];
             TextureDesc& dst = texDescs[i];
-            dst.width = src.width; dst.height = src.height; dst.fmt = src.fmt; dst.mipmapsCount = src.mipmapsCount;
-            UINT blockW = DivUp(dst.width, 4u), blockH = DivUp(dst.height, 4u);
-            UINT dataSize = blockW * GetBytesPerBlock(dst.fmt) * blockH;
-            dst.pData = malloc(dataSize);
-            if (dst.pData && src.pData) memcpy(dst.pData, src.pData, dataSize);
+            dst.width = src.width;
+            dst.height = src.height;
+            dst.fmt = src.fmt;
+            dst.mipmapsCount = src.mipmapsCount;
+            // Копируем данные мипов
+            UINT totalSize = 0;
+            for (UINT32 mip = 0; mip < src.mipmapsCount; ++mip)
+            {
+                UINT32 w = max(src.width >> mip, 1u);
+                UINT32 h = max(src.height >> mip, 1u);
+                UINT32 blockW = DivUp(w, 4u);
+                UINT32 blockH = DivUp(h, 4u);
+                UINT32 mipSize = blockW * GetBytesPerBlock(src.fmt) * blockH;
+                totalSize += mipSize;
+            }
+            dst.pData = malloc(totalSize);
+            if (dst.pData && src.pData) memcpy(dst.pData, src.pData, totalSize);
+            // Копируем векторы указателей на мипы
+            mipDataPerTex[i] = mipDataPerTex[firstIdx];
+            mipPitchesPerTex[i] = mipPitchesPerTex[firstIdx];
             loaded[i] = true;
         }
     }
 
-    // Validate all formats/sizes match
+    // Проверка совпадения форматов и размеров (с учётом числа мипов)
     DXGI_FORMAT fmt = texDescs[firstIdx].fmt;
     UINT width = texDescs[firstIdx].width, height = texDescs[firstIdx].height;
+    UINT mipCount = texDescs[firstIdx].mipmapsCount;
     for (UINT i = 0; i < NUM_TEXTURES; ++i)
     {
-        if (texDescs[i].fmt != fmt || texDescs[i].width != width || texDescs[i].height != height)
+        if (texDescs[i].fmt != fmt || texDescs[i].width != width ||
+            texDescs[i].height != height || texDescs[i].mipmapsCount != mipCount)
         {
             for (auto& td : texDescs) if (td.pData) free(td.pData);
-            MessageBoxA(NULL, "Textures must have same format and size", "Error", MB_OK); return;
+            MessageBoxA(NULL, "Textures must have same format, size and mipmap count", "Error", MB_OK);
+            return;
         }
     }
 
     D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width = width; texDesc.Height = height; texDesc.MipLevels = 1; texDesc.ArraySize = NUM_TEXTURES;
-    texDesc.Format = fmt; texDesc.SampleDesc.Count = 1; texDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = mipCount;
+    texDesc.ArraySize = NUM_TEXTURES;
+    texDesc.Format = fmt;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_IMMUTABLE;
     texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-    UINT blockWidth = DivUp(width, 4u), blockHeight = DivUp(height, 4u);
-    UINT pitch = blockWidth * GetBytesPerBlock(fmt);
-    std::vector<D3D11_SUBRESOURCE_DATA> initData(NUM_TEXTURES);
-    for (UINT i = 0; i < NUM_TEXTURES; ++i)
+    // Подготавливаем SubresourceData для каждого элемента массива и каждого мипа
+    UINT totalSubresources = NUM_TEXTURES * mipCount;
+    std::vector<D3D11_SUBRESOURCE_DATA> initData(totalSubresources);
+
+    UINT idx = 0;
+    for (UINT tex = 0; tex < NUM_TEXTURES; ++tex)
     {
-        initData[i].pSysMem = texDescs[i].pData;
-        initData[i].SysMemPitch = pitch;
-        initData[i].SysMemSlicePitch = pitch * blockHeight;
+        for (UINT32 mip = 0; mip < mipCount; ++mip)
+        {
+            initData[idx].pSysMem = mipDataPerTex[tex][mip];
+            initData[idx].SysMemPitch = mipPitchesPerTex[tex][mip];
+            initData[idx].SysMemSlicePitch = 0;
+            ++idx;
+        }
     }
 
     ID3D11Texture2D* pTexArray = nullptr;
     HRESULT hr = g_pDevice->CreateTexture2D(&texDesc, initData.data(), &pTexArray);
+
+    // Освобождаем выделенную память (каждый TextureDesc.pData указывает на начало блока всех мипов)
     for (auto& td : texDescs) if (td.pData) free(td.pData);
+
     if (FAILED(hr)) return;
 
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-    srvDesc.Format = fmt; srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-    srvDesc.Texture2DArray.MipLevels = 1; srvDesc.Texture2DArray.ArraySize = NUM_TEXTURES;
+    srvDesc.Format = fmt;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    srvDesc.Texture2DArray.MipLevels = mipCount;
+    srvDesc.Texture2DArray.ArraySize = NUM_TEXTURES;
     srvDesc.Texture2DArray.FirstArraySlice = 0;
+
     g_pDevice->CreateShaderResourceView(pTexArray, &srvDesc, &g_pTextureArrayView);
     pTexArray->Release();
 }
