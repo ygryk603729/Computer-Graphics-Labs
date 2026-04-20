@@ -227,7 +227,7 @@ UINT g_ClientHeight = 720;
 // Управление камерой
 float g_CameraYaw = 0.0f;
 float g_CameraPitch = 0.3f;
-float g_CameraDist = 5.0f;
+float g_CameraDist = 3.0f;
 bool g_KeyLeft = false, g_KeyRight = false, g_KeyUp = false, g_KeyDown = false;
 double g_LastTime = 0.0;
 
